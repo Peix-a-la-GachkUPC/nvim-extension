@@ -4,19 +4,13 @@ local bit = bit
 local M = {}
 
 local WS_HOST = "127.0.0.1"
-local WS_PORT = 42069
+local WS_PORT = 42070
 local WS_PATH = "/"
 local RECONNECT_MS = 1000
-local SEND_DEBOUNCE_MS = 500
-local SEND_MAX_WAIT_MS = 1000
 
 local snapshots = {}
 local attached = {}
 local applying_remote = 0
-
-local pending_by_buf = {}
-local flush_timer_by_buf = {}
-local first_buffered_at_by_buf = {}
 
 local client = {
   tcp = nil,
@@ -189,50 +183,6 @@ local function send_payload(obj)
   client.tcp:write(ws_frame_text(encoded))
 end
 
-local function flush_buffered(bufnr)
-  local timer = flush_timer_by_buf[bufnr]
-  if timer then
-    timer:stop()
-    timer:close()
-    flush_timer_by_buf[bufnr] = nil
-  end
-
-  local commands = pending_by_buf[bufnr]
-  if not commands or #commands == 0 then
-    pending_by_buf[bufnr] = nil
-    first_buffered_at_by_buf[bufnr] = nil
-    return
-  end
-
-  send_payload(commands)
-  pending_by_buf[bufnr] = nil
-  first_buffered_at_by_buf[bufnr] = nil
-end
-
-local function schedule_flush(bufnr)
-  local existing = flush_timer_by_buf[bufnr]
-  if existing then
-    existing:stop()
-    existing:close()
-  end
-
-  local now = uv.now()
-  local first = first_buffered_at_by_buf[bufnr] or now
-  first_buffered_at_by_buf[bufnr] = first
-
-  local elapsed = now - first
-  local remaining_max_wait = math.max(0, SEND_MAX_WAIT_MS - elapsed)
-  local delay = math.min(SEND_DEBOUNCE_MS, remaining_max_wait)
-
-  local timer = uv.new_timer()
-  timer:start(delay, 0, function()
-    vim.schedule(function()
-      flush_buffered(bufnr)
-    end)
-  end)
-  flush_timer_by_buf[bufnr] = timer
-end
-
 local function byte_to_row_col(text, byte_index)
   local row = 0
   local line_start = 1
@@ -252,9 +202,33 @@ local function byte_to_row_col(text, byte_index)
   return row, col
 end
 
-local function apply_remote_commands(commands)
-  local bufnr = vim.api.nvim_get_current_buf()
-  if not is_trackable(bufnr) then
+local function row_col_to_byte(text, row, col)
+  row = math.max(0, row or 0)
+  col = math.max(0, col or 0)
+
+  local current_row = 0
+  local line_start = 1
+  while current_row < row do
+    local nl = text:find("\n", line_start, true)
+    if not nl then
+      return #text
+    end
+    current_row = current_row + 1
+    line_start = nl + 1
+  end
+
+  local line_end = text:find("\n", line_start, true)
+  if not line_end then
+    line_end = #text + 1
+  end
+
+  local max_col = math.max(0, (line_end - line_start))
+  local clamped_col = math.min(col, max_col)
+  return (line_start - 1) + clamped_col
+end
+
+local function apply_remote_commands(bufnr, commands)
+  if not is_trackable(bufnr) or not vim.api.nvim_buf_is_valid(bufnr) then
     return
   end
 
@@ -262,16 +236,45 @@ local function apply_remote_commands(commands)
   for _, command in ipairs(commands) do
     local text_before = buf_text(bufnr)
     local text_len = #text_before
-    local index = math.min(math.max(0, command.index or 0), text_len)
-    local row, col = byte_to_row_col(text_before, index)
+    local row, col
+    if type(command.pos) == "table" and type(command.pos.line) == "number" and type(command.pos.column) == "number" then
+      row = math.max(0, math.floor(command.pos.line))
+      col = math.max(0, math.floor(command.pos.column))
+    else
+      local index = math.min(math.max(0, command.index or 0), text_len)
+      row, col = byte_to_row_col(text_before, index)
+    end
+
+    local max_row = vim.api.nvim_buf_line_count(bufnr) - 1
+    if row > max_row then
+      row = max_row
+    end
+
+    local line_content = vim.api.nvim_buf_get_lines(bufnr, row, row + 1, true)[1] or ""
+    local max_col = #line_content
+    if col > max_col then
+      col = max_col
+    end
 
     if command.add ~= nil then
       vim.api.nvim_buf_set_text(bufnr, row, col, row, col, vim.split(command.add, "\n", { plain = true }))
     elseif command.del ~= nil then
       local del = math.max(0, command.del or (type(command.deleted_text) == "string" and #command.deleted_text or 0))
-      local end_index = math.min(index + del, text_len)
-      local r2, c2 = byte_to_row_col(text_before, end_index)
-      vim.api.nvim_buf_set_text(bufnr, row, col, r2, c2, {})
+      local start_index = row_col_to_byte(text_before, row, col)
+      local end_index = math.min(start_index + del, text_len)
+      if end_index > start_index then
+        local r2, c2 = byte_to_row_col(text_before, end_index)
+        local max_row2 = vim.api.nvim_buf_line_count(bufnr) - 1
+        if r2 > max_row2 then
+          r2 = max_row2
+        end
+        local line_content2 = vim.api.nvim_buf_get_lines(bufnr, r2, r2 + 1, true)[1] or ""
+        local max_col2 = #line_content2
+        if c2 > max_col2 then
+          c2 = max_col2
+        end
+        vim.api.nvim_buf_set_text(bufnr, row, col, r2, c2, {})
+      end
     end
   end
   applying_remote = applying_remote - 1
@@ -285,17 +288,26 @@ local function handle_message(text)
     return
   end
 
-  if type(decoded) ~= "table" or type(decoded.value) ~= "string" then
-    return
+  local commands
+  if type(decoded) == "table" and type(decoded.value) == "string" then
+    local ok2, inner = pcall(json_decode, decoded.value)
+    if ok2 and type(inner) == "table" then
+      commands = inner
+    end
+  elseif type(decoded) == "table" then
+    commands = decoded
   end
 
-  local ok2, commands = pcall(json_decode, decoded.value)
-  if not ok2 or type(commands) ~= "table" then
+  if type(commands) ~= "table" then
     return
   end
 
   vim.schedule(function()
-    apply_remote_commands(commands)
+    for bufnr, _ in pairs(attached) do
+      if vim.api.nvim_buf_is_valid(bufnr) then
+        apply_remote_commands(bufnr, commands)
+      end
+    end
   end)
 end
 
@@ -421,10 +433,7 @@ local function attach_buffer(bufnr)
   vim.api.nvim_buf_attach(bufnr, false, {
     on_detach = function()
       attached[bufnr] = nil
-      flush_buffered(bufnr)
       snapshots[bufnr] = nil
-      pending_by_buf[bufnr] = nil
-      first_buffered_at_by_buf[bufnr] = nil
       return true
     end,
     on_bytes = function(_, _, _, _, _, start_byte, _, _, old_end_byte, _, _, new_end_byte)
@@ -437,11 +446,12 @@ local function attach_buffer(bufnr)
       local current = buf_text(bufnr)
       local commands = {}
       local del = old_end_byte
+      local row, col = byte_to_row_col(before, start_byte)
       if del > 0 then
         local from = math.min(math.max(0, start_byte), #before)
         local to = math.min(from + del, #before)
         local deleted_text = before:sub(from + 1, to)
-        commands[#commands + 1] = { index = start_byte, del = del, deleted_text = deleted_text }
+        commands[#commands + 1] = { pos = { line = row, column = col }, del = del, deleted_text = deleted_text }
       end
 
       local add_text = ""
@@ -449,15 +459,11 @@ local function attach_buffer(bufnr)
         add_text = current:sub(start_byte + 1, start_byte + new_end_byte)
       end
       if #add_text > 0 then
-        commands[#commands + 1] = { index = start_byte, add = add_text }
+        commands[#commands + 1] = { pos = { line = row, column = col }, add = add_text }
       end
 
       if #commands > 0 then
-        pending_by_buf[bufnr] = pending_by_buf[bufnr] or {}
-        for _, cmd in ipairs(commands) do
-          pending_by_buf[bufnr][#pending_by_buf[bufnr] + 1] = cmd
-        end
-        schedule_flush(bufnr)
+        send_payload(commands)
       end
 
       snapshots[bufnr] = current
@@ -486,9 +492,6 @@ function M.setup()
   vim.api.nvim_create_autocmd("VimLeavePre", {
     group = group,
     callback = function()
-      for bufnr, _ in pairs(pending_by_buf) do
-        flush_buffered(bufnr)
-      end
       if client.tcp then
         client.tcp:close()
         client.tcp = nil

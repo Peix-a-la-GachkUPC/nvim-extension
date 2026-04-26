@@ -6,8 +6,8 @@ It:
 
 - connects to `ws://127.0.0.1:42069`
 - listens for remote change commands and applies them to the current buffer
-- watches local edits and sends compact `{ index, add }` / `{ index, del }` commands
-- batches outgoing edits with debounce (`100ms`) and max wait (`200ms`)
+- watches local edits and sends compact `{ pos: { line, column }, add }` / `{ pos: { line, column }, del }` commands
+- sends outgoing edits immediately as they are observed
 - auto-reconnects on websocket disconnect
 
 ## Install
